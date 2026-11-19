@@ -687,8 +687,17 @@
     }
 
     async function verifyManagerContext() {
-      // A successful same-origin API4 response confirms that Manager is
-      // serving this Custom Button inside an authenticated business session.
+      // Manager Desktop 26.x serves URL Custom Button HTML through
+      // /api4/custom-button-html?q=<business-context>. The q value must be
+      // forwarded to every API4 request; this is not the iframe postMessage API.
+      const context = new URLSearchParams(window.location.search);
+      if (!context.get('q')) {
+        throw new Error(
+          'Manager Desktop did not supply its business context (q). ' +
+          'This dashboard must be opened from the saved Custom Button inside an open business.'
+        );
+      }
+      console.info('[Manager Personal Finance] Custom Button context detected; query keys:', [...context.keys()]);
       await api4Get('/api4/bank-or-cash-account-batch?skip=0', 20000);
     }
 
