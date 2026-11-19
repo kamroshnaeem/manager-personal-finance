@@ -737,6 +737,57 @@
       return 0;
     }
 
+    function collectBalanceRows(value, out = []) {
+      if (!value || typeof value !== 'object') return out;
+      if (Array.isArray(value)) {
+        value.forEach(item => collectBalanceRows(item, out));
+        return out;
+      }
+      const keys = Object.keys(value);
+      const hasAccountRef = keys.some(k => ['account','accountName','accountKey','balanceSheetAccount','profitAndLossStatementAccount','name','Name'].includes(k));
+      const hasValue = keys.some(k => ['balance','closingBalance','amount','netAmount','debit','credit','debitBalance','creditBalance','actualBalance'].includes(k));
+      if (hasAccountRef && hasValue) out.push(value);
+      Object.values(value).forEach(child => {
+        if (child && typeof child === 'object') collectBalanceRows(child, out);
+      });
+      return out;
+    }
+
+    function referenceKey(value) {
+      if (value && typeof value === 'object') return String(value._key || value.key || value.id || value.guid || '');
+      return String(value || '');
+    }
+
+    function referenceName(value) {
+      if (value && typeof value === 'object') return String(value.name || value.Name || value.value || value.label || '');
+      return String(value || '');
+    }
+
+    function extractBalanceFromRow(row) {
+      const direct = numericValue(row, ['balance','Balance','closingBalance','closing_balance','actualBalance','actual_balance','netAmount','net_amount','amount','Amount']);
+      if (direct) return direct;
+      const debit = numericValue(row, ['debitBalance','debit_balance','debit','Debit']);
+      const credit = numericValue(row, ['creditBalance','credit_balance','credit','Credit']);
+      return debit || credit ? Math.abs(debit - credit) : null;
+    }
+
+    function findAccountBalance(account, rows) {
+      const accountKey = String(account._key || account.key || '');
+      const accountName = String(account.name || '').trim().toLowerCase();
+      for (const row of rows) {
+        const refs = ['account','accountKey','account_key','balanceSheetAccount','profitAndLossStatementAccount','bankOrCashAccount','bankAccount'];
+        const refValues = refs.map(k => row[k]).filter(v => v !== undefined && v !== null);
+        const keyMatch = accountKey && refValues.some(v => referenceKey(v) === accountKey);
+        const nameMatch = accountName && refValues.some(v => referenceName(v).trim().toLowerCase() === accountName);
+        const rowName = String(firstValue(row, ['accountName','name','Name'], '')).trim().toLowerCase();
+        if (keyMatch || nameMatch || rowName === accountName) {
+          const balance = extractBalanceFromRow(row);
+          if (balance !== null) return balance;
+        }
+      }
+      return null;
+    }
+
     function normalizeApi4Account(a, i) {
       const typeRaw = String(firstValue(a, ['accountType','type','classification','group','accountTypeName'], 'Asset')).toLowerCase();
       const type = typeRaw.includes('liabil') ? 'Liability' : typeRaw.includes('equity') || typeRaw.includes('capital') ? 'Equity' : typeRaw.includes('income') ? 'Income' : typeRaw.includes('expense') ? 'Expense' : 'Asset';
@@ -790,6 +841,9 @@
         await verifyManagerContext();
         const endpoints = [
           ['bank-or-cash-account-batch','Bank & cash accounts'],
+          ['bank-account-summary-batch','Bank account summaries'],
+          ['trial-balance-batch','Trial balance records'],
+          ['general-ledger-summary-batch','General ledger summaries'],
           ['balance-sheet-account-batch','Balance-sheet accounts'],
           ['profit-and-loss-statement-account-batch','Profit & loss accounts'],
           ['receipt-batch','Receipts'], ['payment-batch','Payments'],
@@ -808,6 +862,53 @@
         const accountsRaw = [...bsRows, ...plRows];
         const accountRows = accountsRaw.length ? accountsRaw : bankRows;
         const accounts = accountRows.map(normalizeApi4Account);
+
+        // Manager's account master endpoints provide names and classifications.
+        // Balances are retrieved separately from Trial Balance / General Ledger
+        // Summary data and matched back by account key first, then exact name.
+        const reports = {};
+        for (const [key,path] of [
+          ['trialBalance','/api4/trial-balance'],
+          ['balanceSheet','/api4/balance-sheet'],
+          ['profitAndLoss','/api4/profit-and-loss-statement'],
+          ['cashFlow','/api4/cash-flow-statement']
+        ]) {
+          try { reports[key] = await api4Get(path); }
+          catch (error) { reports[key] = { unavailable: error.message }; }
+        }
+        const balanceRows = [
+          ...collectBalanceRows(reports.trialBalance),
+          ...collectBalanceRows(reports.balanceSheet),
+          ...collectBalanceRows(loaded['trial-balance-batch'].rows),
+          ...collectBalanceRows(loaded['general-ledger-summary-batch'].rows)
+        ];
+        accounts.forEach(account => {
+          const balance = findAccountBalance(account, balanceRows);
+          if (balance !== null) account.balance = balance;
+        });
+
+        // Bank Account Summary is a separate Manager API resource. Use it where
+        // the response contains a current balance for the matching bank account.
+        const bankSummaryRows = loaded['bank-account-summary-batch'].rows;
+        bankRows.forEach(bank => {
+          const bankKey = String(bank._key || bank.key || '');
+          const bankName = String(firstValue(bank, ['name','Name','accountName'], '')).trim().toLowerCase();
+          const summary = bankSummaryRows.find(row => {
+            const refs = ['bankOrCashAccount','bankOrCashAccountKey','bankAccount','bankAccountKey','account','accountKey'];
+            return refs.some(k => {
+              const value = row[k];
+              return (bankKey && referenceKey(value) === bankKey) ||
+                (bankName && referenceName(value).trim().toLowerCase() === bankName);
+            }) || String(firstValue(row, ['name','accountName'], '')).trim().toLowerCase() === bankName;
+          });
+          if (summary) {
+            const balance = extractBalanceFromRow(summary);
+            if (balance !== null) {
+              const linked = accounts.find(a => a.name.trim().toLowerCase() === bankName);
+              if (linked) linked.balance = balance;
+            }
+          }
+        });
         const transactionTypes = [
           ['receipt-batch','Receipt'], ['payment-batch','Payment'],
           ['inter-account-transfer-batch','Transfer'], ['sales-invoice-batch','Sales Invoice'],
@@ -819,18 +920,6 @@
           loaded[path].rows.map((x,i) => normalizeApi4Transaction(x,type,i))
         ).filter(x => x.date || x.amount > 0).sort((a,b) => (b.date || '').localeCompare(a.date || ''));
 
-        // Retrieve Manager's native financial statements where exposed by the API.
-        // Raw responses are retained for diagnostics; the dashboard never fabricates statement totals.
-        const reports = {};
-        for (const [key,path] of [
-          ['balanceSheet','/api4/balance-sheet'],
-          ['profitAndLoss','/api4/profit-and-loss-statement'],
-          ['cashFlow','/api4/cash-flow-statement']
-        ]) {
-          try { reports[key] = await api4Get(path); }
-          catch (error) { reports[key] = { unavailable: error.message }; }
-        }
-
         const failures = endpoints.filter((_,i) => results[i].error).map(([path,label]) => `${label}: ${loaded[path].error}`);
         if (!accounts.length && !transactions.length && Object.values(reports).every(x => x?.unavailable)) {
           throw new Error(`Manager.io did not return usable accounting data. ${failures.slice(0,3).join(' | ')}`);
@@ -839,7 +928,7 @@
           source: 'Manager.io API4', accounts, transactions,
           monthlySeries: buildMonthlySeriesFromTransactions(transactions, accounts),
           budgets: buildBudgetsFromAccounts(accounts),
-          reports, api4Diagnostics: { loaded: endpoints.map(([path,label],i) => ({label, count:results[i].rows.length, error:results[i].error})), failures }
+          reports, api4Diagnostics: { loaded: endpoints.map(([path,label],i) => ({label, count:results[i].rows.length, error:results[i].error})), balanceRows: balanceRows.length, failures }
         };
         updateConnectionBadge('extension', 'Connected: Manager.io API4');
         renderAll();
