@@ -49,7 +49,7 @@
     .tabular-nums {
       font-variant-numeric: tabular-nums;
     }
-    /* Custom scrollbar for sleek iframe integration */
+    /* Custom scrollbar for the embedded Manager.io dashboard view */
     ::-webkit-scrollbar {
       width: 6px;
       height: 6px;
@@ -649,11 +649,39 @@
      * and no postMessage handshake are used for this Custom Button mechanism.
      */
     function managerContextQuery() {
-      const params = new URLSearchParams(window.location.search);
-      if (!params.has('q') || !params.get('q')) {
-        throw new Error('Manager business context is missing. Open this dashboard from its Manager.io Custom Button, not from the public GitHub Pages URL.');
+      // Manager 26.x serves URL-based Custom Button HTML from its own origin.
+      // The business/view context is carried in the original query string (normally q=...).
+      // Do not require an iframe: current Custom Buttons are not the legacy iframe extension.
+      if (window.location.origin === 'https://kamroshnaeem.github.io') {
+        throw new Error('This is the public GitHub Pages address. Open the dashboard using its Manager.io Custom Button so Manager can provide the active business context.');
       }
-      return window.location.search;
+      return window.location.search || '';
+    }
+
+    async function verifyManagerContext(timeoutMs = 15000) {
+      const query = managerContextQuery();
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(`/api4/view-v1${query}`, {
+          method: 'GET',
+          headers: { 'Accept': 'application/json' },
+          credentials: 'same-origin',
+          cache: 'no-store',
+          signal: controller.signal
+        });
+        const body = await response.text();
+        if (!response.ok) {
+          throw new Error(`Manager.io could not resolve the active view/business context (HTTP ${response.status}). Reopen the dashboard from the Custom Button inside the required business. ${body ? body.slice(0, 220) : ''}`);
+        }
+        try { return body ? JSON.parse(body) : null; }
+        catch (error) { throw new Error(`Manager.io returned an unexpected response while checking business context: ${error.message}`); }
+      } catch (error) {
+        if (error.name === 'AbortError') throw new Error('Timed out while checking the Manager.io business context.');
+        throw error;
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
     async function api4Get(path, timeoutMs = 30000) {
@@ -765,12 +793,9 @@
     }
 
     async function requestManagerExtensionSync() {
-      if (window.self === window.top) {
-        showToast('Open from Manager.io', 'Live sync is available when this dashboard is opened from your Manager.io Custom Button.', 'warning');
-        return;
-      }
       try {
-        showToast('Connecting…', 'Loading your chart of accounts, balance-sheet accounts and accounting transactions.', 'info');
+        showToast('Connecting…', 'Checking the active Manager.io business, then loading your accounting data.', 'info');
+        await verifyManagerContext();
         const endpoints = [
           ['bank-or-cash-account-batch','Bank & cash accounts'],
           ['balance-sheet-account-batch','Balance-sheet accounts'],
