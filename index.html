@@ -441,7 +441,7 @@
       <!-- Modal Body -->
       <div class="p-6 overflow-y-auto space-y-5 text-sm">
         
-        <!-- Manager.io API4 connection -->
+        <!-- Manager.io API4 Custom Button connection -->
         <div id="tab-extension" class="modal-panel space-y-4">
           <div class="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 space-y-2">
             <div class="font-semibold text-slate-900 dark:text-white">Manager.io Custom Button connection</div>
@@ -648,18 +648,32 @@
      * use same-origin fetch + the signed-in Manager session cookies; no token
      * and no postMessage handshake are used for this Custom Button mechanism.
      */
-    function managerContextQuery() {
-      // Manager 26.x serves URL-based Custom Button HTML from its own origin.
-      // The business/view context is carried in the original query string (normally q=...).
-      // Do not require an iframe: current Custom Buttons are not the legacy iframe extension.
-      if (window.location.origin === 'https://kamroshnaeem.github.io') {
-        throw new Error('This is the public GitHub Pages address. Open the dashboard using its Manager.io Custom Button so Manager can provide the active business context.');
+    // Manager 26.x URL Custom Buttons are served same-origin by Manager.
+    // The opaque `q` parameter in the page URL carries the active business context.
+    // Keep that parameter on every API4 request; this is NOT the legacy iframe extension API.
+    function managerContextParams() {
+      const params = new URLSearchParams(window.location.search || '');
+      const context = params.get('q');
+      if (!context) {
+        const keys = [...params.keys()].join(', ') || '(none)';
+        throw new Error(`Manager did not provide its business-context parameter (q). Current page: ${window.location.pathname}; query parameters: ${keys}. Reopen this button from inside the required business in Manager.io.`);
       }
-      return window.location.search || '';
+      return params;
+    }
+
+    function managerApi4Url(path) {
+      const url = new URL(path, window.location.origin);
+      const contextParams = managerContextParams();
+      // Preserve endpoint parameters such as skip=0, and carry Manager's context
+      // parameter unchanged (URLSearchParams safely handles URL encoding).
+      for (const [key, value] of contextParams.entries()) {
+        url.searchParams.set(key, value);
+      }
+      return `${url.pathname}${url.search}`;
     }
 
     async function verifyManagerContext(timeoutMs = 15000) {
-      const query = managerContextQuery();
+      const query = `?${managerContextParams().toString()}`;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
@@ -685,8 +699,7 @@
     }
 
     async function api4Get(path, timeoutMs = 30000) {
-      const contextQuery = managerContextQuery();
-      const url = `${path}${path.includes('?') ? '&' : '?'}${contextQuery.slice(1)}`;
+      const url = managerApi4Url(path);
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
